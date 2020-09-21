@@ -36,15 +36,19 @@ revealed several limitations, which this code attempts to address:
 """
 import functools
 import math
+import random as pyrandom
 import jax
 
 from trax import fastmath
+from trax import layers as tl
 from trax.fastmath import numpy as np
 from trax.layers import base
 from trax.layers import combinators as cb
 from trax.layers import core
 from trax.layers import initializers as init
 from trax.layers import metrics
+from trax.layers import reversible
+from trax.layers.assert_shape import assert_shape
 
 
 ####################################################### Functions
@@ -930,6 +934,174 @@ class EfficientAttentionBase(base.Layer):
       return (o_all, s_all, i_ct_all[0], w_ct_all)
     else:
       return (o_all, s_all, i_ct_all, w_ct_all)
+
+
+@assert_shape('...->...')
+class ReversibleReshapePermute(reversible.ReversibleLayer):
+  """Simple and fast reversible permutation layer.
+
+  It works for shapes being powers of 2.
+  """
+
+  def forward(self, x):
+    shape = x.shape
+    x = x.reshape(shape[:-1]+(-1, self.get_multiplier(x)))
+    t_x = np.einsum('...ab->...ba', x)  # transpose
+    return t_x.reshape(shape)
+
+  def reverse(self, x, weights=(), state=(), new_state=(), rng=None):
+    del state, new_state, rng
+    shape = x.shape
+    x = x.reshape(shape[:-1]+(self.get_multiplier(x), -1))
+    t_x = np.einsum('...ab->...ba', x)  # transpose
+    return t_x.reshape(shape)
+
+  def get_multiplier(self, x):
+    last_dim = x.shape[-1]
+    multipliers = {
+        2: 1,  # 1 -> 0
+        4: 2,  # 2 -> 1
+        8: 2,  # 3 -> 1
+        16: 2,  # 4 -> 1
+        32: 4,  # 5 -> 2
+        64: 2,  # 6 -> 1
+        128: 8,  # 7 -> 3
+        256: 8,  # 8 -> 3
+        512: 16,  # 9 -> 4
+        1024: 16,  # 10 -> 4
+        2*1024: 16,  # 11 -> 4
+        4*1024: 16,  # 12 -> 5
+        8*1024: 16,  # 13 -> 5
+        16*1024: 16,  # 14 -> 5
+    }
+    return multipliers[last_dim]
+
+
+@assert_shape('...->...')
+class ReversibleRandomPermute(reversible.ReversibleLayer):
+  """Reversible, expensive permutation layer."""
+
+  def forward(self, x):
+    permutation, _ = self.weights
+    return x[..., permutation]
+
+  def reverse(self, x, weights=(), state=(), new_state=(), rng=None):
+    _, rev_permutation = weights
+    return x[..., rev_permutation]
+
+  def init_weights_and_state(self, input_signature):
+    last_dim = input_signature.shape[-1]
+    permutation = list(range(last_dim))
+    pyrandom.shuffle(permutation)
+    rev_permutation = [permutation.index(i) for i in range(last_dim)]
+    # Q: should I store it in state instead?
+    self.weights = (np.array(permutation), np.array(rev_permutation))
+
+
+@assert_shape('...a->...bc')
+def SplitLastAxis(modules):  # pylint: disable=invalid-name
+  return tl.Fn(f'SplitLastAxis_{modules}',
+               lambda x: np.reshape(x, x.shape[:-1] + (modules, -1)))
+
+
+@assert_shape('...ab->...c')
+def MergeLastTwoAxes():  # pylint: disable=invalid-name
+  return tl.Fn('SplitLastAxis',
+               lambda x: np.reshape(x, x.shape[:-2] + (-1,)))
+
+
+@assert_shape('...a->...b')
+def GroupedConvolution(n_modules, n_units, kernel_size=1,  # pylint: disable=invalid-name
+                       kernel_initializer=init.GlorotUniformInitializer(),
+                       bias_initializer=init.RandomNormalInitializer(1e-6),
+                       use_bias=True):
+  if n_modules == 1:
+    return tl.Dense(n_units, kernel_initializer=kernel_initializer,
+                    bias_initializer=bias_initializer, use_bias=use_bias)
+  return tl.Serial(
+      tl.SplitLastAxis(n_modules),
+      tl.LocallyConnected1d(
+          n_units, kernel_size, kernel_initializer=kernel_initializer,
+          bias_initializer=bias_initializer, use_bias=use_bias, padding='WRAP'),
+      tl.MergeLastTwoAxes())
+
+
+@assert_shape('bld->bld')
+def ModularCausalAttention(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-name
+                           max_inference_length=2048,
+                           n_modules=1, permute_layer=ReversibleReshapePermute,
+                           mode='train'):
+  """Returns a layer that maps activations to activations, with causal masking.
+
+  Like `CausalAttention`, this layer type represents one pass of multi-head
+  self-attention with causal masking rather than padding-based masking. However,
+  it uses GroupedConvolution instead of Dense layer for computing K/Q/V vectors.
+
+  Args:
+    d_feature: Depth/dimensionality of feature embedding.
+    n_heads: Number of attention heads.
+    dropout: Probababilistic rate for internal dropout applied to attention
+        activations (based on query-key pairs) before dotting them with values.
+    max_inference_length: maximum length for inference.
+    n_modules: Number of modules in ModularDense.
+    permute_layer: Permutation to use.
+    mode: One of `'train'`, `'eval'`, or `'predict'`.
+  """
+  if d_feature % n_heads != 0:
+    raise ValueError(
+        f'Dimensionality of feature embedding ({d_feature}) is not a multiple '
+        f'of the requested number of attention heads ({n_heads}).')
+
+  d_head = d_feature // n_heads
+
+  @assert_shape('bld->hlx')
+  def _split_into_heads():
+    """Returns a layer that reshapes tensors for multi-headed computation."""
+    def f(x):
+      batch_size = x.shape[0]
+      seq_len = x.shape[1]
+
+      # (b_size, seq_len, d_feature) --> (b_size*n_heads, seq_len, d_head)
+      x = x.reshape((batch_size, seq_len, n_heads, d_head))
+      x = x.transpose((0, 2, 1, 3))
+      x = x.reshape((batch_size * n_heads, seq_len, d_head))
+      return x
+    return tl.Fn('SplitIntoHeads', f)
+
+  @assert_shape('hlx->bld')
+  def _merge_heads():
+    """Returns a layer that undoes splitting, after multi-head computation."""
+    def f(x):
+      seq_len = x.shape[1]
+
+      # (b_size*n_heads, seq_len, d_head) --> (b_size, seq_len, d_feature)
+      x = x.reshape((-1, n_heads, seq_len, d_head))
+      x = x.transpose((0, 2, 1, 3))
+      x = x.reshape((-1, seq_len, d_head * n_heads))
+      return x
+    return tl.Fn('MergeHeads', f)
+
+  @assert_shape('...a->...b')
+  def processor_creator():
+    if n_modules == 1:
+      return tl.Dense(d_feature)
+    else:
+      assert d_feature % n_modules == 0
+      return GroupedConvolution(d_feature // n_modules, n_modules)
+
+  return cb.Serial(
+      permute_layer() if permute_layer else tl.Serial(),
+      cb.Branch(
+          [processor_creator(), _split_into_heads()],
+          [processor_creator(), _split_into_heads()],
+          [processor_creator(), _split_into_heads()],
+      ),
+      tl.DotProductCausalAttention(
+          dropout=dropout, max_inference_length=max_inference_length,
+          mode=mode),
+      _merge_heads(),
+      processor_creator()
+  )
 
 
 class SelfAttention(EfficientAttentionBase):

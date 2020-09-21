@@ -393,11 +393,15 @@ def EncoderBlock(d_model, d_ff, n_heads, attention_type, dropout, ff_activation,
     # to 'eval' mode instead.
     mode = 'eval'
 
-  attention = attention_type(
-      n_heads=n_heads, d_qk=d_model//n_heads, d_v=d_model//n_heads,
-      masked=True, causal=False,
-      attention_dropout=dropout, output_dropout=dropout,
-      mode=mode)
+  try:
+    attention = attention_type(
+        n_heads=n_heads, d_qk=d_model//n_heads, d_v=d_model//n_heads,
+        masked=True, causal=False,
+        attention_dropout=dropout, output_dropout=dropout,
+        mode=mode)
+  except TypeError:  # No d_qk arguments in less advanced layers.
+    attention = attention_type(d_model, n_heads=n_heads,
+                               dropout=dropout, mode=mode)
   attention_half_residual = tl.ReversibleHalfResidual(
       tl.LayerNorm(),
       attention_layer=attention,
